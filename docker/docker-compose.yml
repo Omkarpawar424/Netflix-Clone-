@@ -1,0 +1,298 @@
+version: '3.8'
+
+services:
+  # PostgreSQL database with PostGIS extension
+  database:
+    image: postgis/postgis:15-3.3
+    container_name: fra-database
+    environment:
+      POSTGRES_DB: fra_database
+      POSTGRES_USER: fra_user
+      POSTGRES_PASSWORD: fra_secure_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - fra-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fra_user -d fra_database"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and session storage
+  redis:
+    image: redis:7-alpine
+    container_name: fra-redis
+    command: redis-server --appendonly yes --requirepass fra_redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - fra-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Main application
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: fra-app
+    environment:
+      # Database
+      DATABASE_URL: postgresql://fra_user:fra_secure_password@database:5432/fra_database
+      
+      # Security
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      ACCESS_TOKEN_EXPIRE_MINUTES: 30
+      REFRESH_TOKEN_EXPIRE_DAYS: 7
+      
+      # Environment
+      ENVIRONMENT: production
+      DEBUG: "false"
+      
+      # File storage
+      UPLOAD_DIR: /app/data/uploads
+      MAX_FILE_SIZE: 104857600  # 100MB
+      
+      # AI Models
+      MODELS_DIR: /app/app/ai_models/trained_models
+      SPACY_MODEL: en_core_web_sm
+      
+      # GIS
+      SATELLITE_DATA_DIR: /app/data/satellite_images
+      DEFAULT_CRS: EPSG:4326
+      INDIA_CRS: EPSG:32643
+      
+      # Performance
+      MAX_CONCURRENT_REQUESTS: 100
+      CACHE_TTL: 3600
+      
+      # Logging
+      LOG_LEVEL: INFO
+      LOG_FILE: /app/logs/fra_dss.log
+      
+      # External APIs (set these in production)
+      GOVERNMENT_API_BASE_URL: ${GOVERNMENT_API_BASE_URL:-}
+      SATELLITE_API_KEY: ${SATELLITE_API_KEY:-}
+      
+      # Redis
+      REDIS_URL: redis://:fra_redis_password@redis:6379/0
+      
+    volumes:
+      - app_data:/app/data
+      - app_logs:/app/logs
+      - app_models:/app/app/ai_models/trained_models
+    ports:
+      - "8000:8000"
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - fra-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: fra-nginx
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - app_logs:/var/log/nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - app
+    networks:
+      - fra-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Celery worker for background tasks
+  celery-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: fra-celery-worker
+    command: celery -A app.tasks.celery worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql://fra_user:fra_secure_password@database:5432/fra_database
+      REDIS_URL: redis://:fra_redis_password@redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      ENVIRONMENT: production
+      LOG_LEVEL: INFO
+    volumes:
+      - app_data:/app/data
+      - app_logs:/app/logs
+      - app_models:/app/app/ai_models/trained_models
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - fra-network
+    restart: unless-stopped
+
+  # Celery beat scheduler
+  celery-beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: fra-celery-beat
+    command: celery -A app.tasks.celery beat --loglevel=info --schedule=/app/celerybeat-schedule
+    environment:
+      DATABASE_URL: postgresql://fra_user:fra_secure_password@database:5432/fra_database
+      REDIS_URL: redis://:fra_redis_password@redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      ENVIRONMENT: production
+      LOG_LEVEL: INFO
+    volumes:
+      - app_data:/app/data
+      - app_logs:/app/logs
+      - celery_beat_data:/app/celerybeat-schedule
+    depends_on:
+      database:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - fra-network
+    restart: unless-stopped
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: fra-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    ports:
+      - "9090:9090"
+    networks:
+      - fra-network
+    restart: unless-stopped
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: fra-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin_password_change_me
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - fra-network
+    restart: unless-stopped
+
+  # Log aggregation with ELK Stack (optional)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.10.0
+    container_name: fra-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - fra-network
+    restart: unless-stopped
+    profiles:
+      - elk
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.10.0
+    container_name: fra-logstash
+    volumes:
+      - ./monitoring/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - app_logs:/app/logs:ro
+    depends_on:
+      - elasticsearch
+    networks:
+      - fra-network
+    restart: unless-stopped
+    profiles:
+      - elk
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.10.0
+    container_name: fra-kibana
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - fra-network
+    restart: unless-stopped
+    profiles:
+      - elk
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  app_data:
+    driver: local
+  app_logs:
+    driver: local
+  app_models:
+    driver: local
+  celery_beat_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+
+networks:
+  fra-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
